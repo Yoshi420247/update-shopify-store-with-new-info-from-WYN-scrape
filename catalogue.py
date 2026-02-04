@@ -242,12 +242,18 @@ class ProductDiff:
     """What changed on a single product."""
     images_changed: bool = False
     price_changed: bool = False
+    compare_at_price_changed: bool = False
     cost_changed: bool = False
     variants_added: bool = False
+    variants_removed: bool = False
+    added_skus: list[str] = field(default_factory=list)
+    removed_skus: list[str] = field(default_factory=list)
 
     @property
     def has_changes(self) -> bool:
-        return self.images_changed or self.price_changed or self.cost_changed or self.variants_added
+        return (self.images_changed or self.price_changed
+                or self.compare_at_price_changed or self.cost_changed
+                or self.variants_added or self.variants_removed)
 
     def __str__(self):
         parts = []
@@ -255,10 +261,14 @@ class ProductDiff:
             parts.append("images")
         if self.price_changed:
             parts.append("price")
+        if self.compare_at_price_changed:
+            parts.append("compare-at-price")
         if self.cost_changed:
             parts.append("cost")
         if self.variants_added:
-            parts.append("new variants")
+            parts.append(f"+{len(self.added_skus)} variants")
+        if self.variants_removed:
+            parts.append(f"-{len(self.removed_skus)} variants")
         return ", ".join(parts) if parts else "none"
 
 
@@ -282,6 +292,14 @@ class SyncPlan:
         return [(old, new, d) for old, new, d in self.to_update if d.cost_changed]
 
     @property
+    def to_add_variants(self) -> list[tuple[Product, Product, ProductDiff]]:
+        return [(old, new, d) for old, new, d in self.to_update if d.variants_added]
+
+    @property
+    def to_remove_variants(self) -> list[tuple[Product, Product, ProductDiff]]:
+        return [(old, new, d) for old, new, d in self.to_update if d.variants_removed]
+
+    @property
     def summary(self) -> str:
         lines = [
             f"  New products to create:        {len(self.to_create)}",
@@ -289,6 +307,8 @@ class SyncPlan:
             f"    - image updates:             {len(self.to_update_images)}",
             f"    - price updates:             {len(self.to_update_prices)}",
             f"    - cost updates:              {len(self.to_update_costs)}",
+            f"    - add variants:              {len(self.to_add_variants)}",
+            f"    - remove variants:           {len(self.to_remove_variants)}",
             f"  Unchanged products:            {len(self.unchanged)}",
         ]
         return "\n".join(lines)
@@ -330,33 +350,48 @@ def _diff_products(old: Product, new: Product) -> ProductDiff:
     if old_images != new_images:
         diff.images_changed = True
 
-    # Price comparison (compare by SKU)
+    # SKU sets
+    old_skus = {v.sku for v in old.variants if v.sku}
+    new_skus = {v.sku for v in new.variants if v.sku}
+
+    # New / removed variants
+    added = new_skus - old_skus
+    removed = old_skus - new_skus
+    if added:
+        diff.variants_added = True
+        diff.added_skus = sorted(added)
+    if removed:
+        diff.variants_removed = True
+        diff.removed_skus = sorted(removed)
+
+    # Price comparison (only for SKUs that exist in both)
     old_prices = {v.sku: v.price for v in old.variants if v.sku}
     new_prices = {v.sku: v.price for v in new.variants if v.sku}
-    for sku, new_price in new_prices.items():
-        old_price = old_prices.get(sku)
-        if old_price is not None and _normalise_price(old_price) != _normalise_price(new_price):
+    for sku in old_skus & new_skus:
+        old_p, new_p = old_prices.get(sku, ""), new_prices.get(sku, "")
+        if old_p and new_p and _normalise_price(old_p) != _normalise_price(new_p):
             diff.price_changed = True
             break
 
-    # Cost comparison
-    old_costs = {v.sku: v.cost for v in old.variants if v.sku and v.cost}
-    new_costs = {v.sku: v.cost for v in new.variants if v.sku and v.cost}
-    for sku, new_cost in new_costs.items():
-        old_cost = old_costs.get(sku)
-        if old_cost is not None and _normalise_price(old_cost) != _normalise_price(new_cost):
-            diff.cost_changed = True
-            break
-        if old_cost is None and new_cost:
-            # New cost where none existed before
-            diff.cost_changed = True
+    # Compare-at-price comparison
+    old_cap = {v.sku: v.compare_at_price for v in old.variants if v.sku}
+    new_cap = {v.sku: v.compare_at_price for v in new.variants if v.sku}
+    for sku in old_skus & new_skus:
+        old_c, new_c = old_cap.get(sku, ""), new_cap.get(sku, "")
+        if _normalise_price(old_c or "0") != _normalise_price(new_c or "0"):
+            diff.compare_at_price_changed = True
             break
 
-    # Check for new variants
-    old_skus = {v.sku for v in old.variants if v.sku}
-    new_skus = {v.sku for v in new.variants if v.sku}
-    if new_skus - old_skus:
-        diff.variants_added = True
+    # Cost comparison
+    old_costs = {v.sku: v.cost for v in old.variants if v.sku}
+    new_costs = {v.sku: v.cost for v in new.variants if v.sku}
+    for sku, new_cost in new_costs.items():
+        if not new_cost:
+            continue
+        old_cost = old_costs.get(sku, "")
+        if not old_cost or _normalise_price(old_cost) != _normalise_price(new_cost):
+            diff.cost_changed = True
+            break
 
     return diff
 
@@ -378,6 +413,40 @@ def _normalise_price(price: str) -> str:
 # Build Shopify API payload from a Product
 # ----------------------------------------------------------------------
 
+def _build_variant_dict(v: Variant) -> dict:
+    """Build a Shopify variant dict from our internal Variant."""
+    vd: dict = {}
+    if v.sku:
+        vd["sku"] = v.sku
+    if v.price:
+        vd["price"] = v.price
+    if v.compare_at_price:
+        vd["compare_at_price"] = v.compare_at_price
+    # Note: cost is NOT set here — Shopify ignores it on the variant object.
+    # Cost must be set via PUT /inventory_items/{id}.json after creation.
+    if v.option1_value:
+        vd["option1"] = v.option1_value
+    if v.option2_value:
+        vd["option2"] = v.option2_value
+    if v.option3_value:
+        vd["option3"] = v.option3_value
+    if v.grams:
+        vd["grams"] = int(float(v.grams))
+    if v.weight_unit:
+        vd["weight_unit"] = v.weight_unit
+    if v.barcode:
+        vd["barcode"] = v.barcode
+    if v.requires_shipping:
+        vd["requires_shipping"] = v.requires_shipping.lower() == "true"
+    if v.taxable:
+        vd["taxable"] = v.taxable.lower() == "true"
+    if v.inventory_policy:
+        vd["inventory_policy"] = v.inventory_policy
+    # Enable inventory tracking so Shopify counts stock
+    vd["inventory_management"] = "shopify"
+    return vd
+
+
 def product_to_shopify_payload(product: Product) -> dict:
     """
     Convert a parsed catalogue Product into a dict suitable for
@@ -394,43 +463,17 @@ def product_to_shopify_payload(product: Product) -> dict:
     }
 
     if product.variants:
-        variant_list = []
-        for v in product.variants:
-            vd: dict = {}
-            if v.sku:
-                vd["sku"] = v.sku
-            if v.price:
-                vd["price"] = v.price
-            if v.compare_at_price:
-                vd["compare_at_price"] = v.compare_at_price
-            if v.cost:
-                vd["cost"] = v.cost
-            if v.option1_value:
-                vd["option1"] = v.option1_value
-            if v.option2_value:
-                vd["option2"] = v.option2_value
-            if v.option3_value:
-                vd["option3"] = v.option3_value
-            if v.grams:
-                vd["grams"] = int(float(v.grams))
-            if v.weight_unit:
-                vd["weight_unit"] = v.weight_unit
-            if v.barcode:
-                vd["barcode"] = v.barcode
-            if v.requires_shipping:
-                vd["requires_shipping"] = v.requires_shipping.lower() == "true"
-            if v.taxable:
-                vd["taxable"] = v.taxable.lower() == "true"
-            if v.inventory_policy:
-                vd["inventory_policy"] = v.inventory_policy
-            variant_list.append(vd)
-        payload["variants"] = variant_list
+        payload["variants"] = [_build_variant_dict(v) for v in product.variants]
 
+        # Derive option names from the first variant that has them
         options = []
-        sample = product.variants[0]
-        for i, name in enumerate([sample.option1_name, sample.option2_name, sample.option3_name], 1):
-            if name:
-                options.append({"name": name, "position": i})
+        for v in product.variants:
+            names = [v.option1_name, v.option2_name, v.option3_name]
+            if any(names):
+                for i, name in enumerate(names, 1):
+                    if name:
+                        options.append({"name": name, "position": i})
+                break
         if options:
             payload["options"] = options
 
@@ -441,3 +484,11 @@ def product_to_shopify_payload(product: Product) -> dict:
         ]
 
     return payload
+
+
+def variant_to_shopify_payload(v: Variant) -> dict:
+    """
+    Build a payload suitable for POST /products/{id}/variants.json
+    (adding a new variant to an existing product).
+    """
+    return _build_variant_dict(v)

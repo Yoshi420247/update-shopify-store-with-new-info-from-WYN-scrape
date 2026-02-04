@@ -5,31 +5,22 @@ WYN -> Shopify Product Sync
 Compares a new "What You Need" vendor catalogue (Shopify-format CSV) against
 the products currently in a Shopify store, then:
 
-  1. Creates products that exist in the catalogue but not in Shopify.
-  2. Updates images on existing products where the catalogue has new images.
-  3. Syncs prices and costs where they differ.
-  4. Auto-tags new products with the Oil Slick taxonomy.
-  5. Publishes new products to the Online Store sales channel.
-  6. Runs a verification pass and writes a JSON report.
+  1. Creates new products (with auto-tags, 2x pricing, inventory tracking).
+  2. Sets costs on newly created products via the Inventory Items API.
+  3. Updates images on existing products where the catalogue has new images.
+  4. Syncs prices and compare-at-prices where they differ.
+  5. Syncs costs on existing products.
+  6. Adds new variants to existing products.
+  7. Publishes new products to the Online Store sales channel.
+  8. Runs a verification pass and writes a JSON report.
+  9. Logs everything to Supabase (if configured) for audit trail.
 
 Usage:
-    # Dry run (default) -- shows what *would* happen, changes nothing:
-    python sync.py
-
-    # Live run -- actually creates/updates products:
-    python sync.py --live
-
-    # Live run in CI (no interactive prompt):
-    python sync.py --live --yes
-
-    # Fetch current state from API instead of a CSV export:
-    python sync.py --from-api
-
-    # Compare only -- just print the diff report:
-    python sync.py --compare-only
-
-    # Verify current state matches catalogue:
-    python sync.py --verify
+    python sync.py --from-api                    # dry run
+    python sync.py --from-api --live --yes       # live, CI mode
+    python sync.py --from-api --compare-only     # diff only
+    python sync.py --verify                      # check store vs catalogue
+    python sync.py --setup-supabase              # print SQL for table setup
 """
 
 import argparse
@@ -49,8 +40,10 @@ from catalogue import (
     parse_shopify_csv,
     product_to_shopify_payload,
     products_from_api,
+    variant_to_shopify_payload,
 )
 from shopify_api import ShopifyClient, ShopifyAPIError
+from supabase_log import SupabaseLogger, print_setup_sql
 from tags import generate_tags, calculate_retail_price
 
 # ------------------------------------------------------------------
@@ -78,7 +71,6 @@ logger = logging.getLogger("sync")
 def load_config() -> dict:
     load_dotenv()
 
-    # Support both SHOPIFY_STORE_URL and SHOPIFY_STORE (GitHub Actions compat)
     store_url = os.getenv("SHOPIFY_STORE_URL") or os.getenv("SHOPIFY_STORE", "")
     access_token = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
 
@@ -102,8 +94,6 @@ def load_config() -> dict:
 
 def build_plan(cfg: dict, client: ShopifyClient = None, from_api: bool = False) -> SyncPlan:
     """Parse both sources and return a SyncPlan."""
-
-    # --- Existing products (Shopify state) ---
     if from_api and client:
         logger.info("Fetching current products from Shopify API (vendor=%s)...", cfg["vendor"])
         api_products = client.get_all_products(vendor=cfg["vendor"])
@@ -112,7 +102,6 @@ def build_plan(cfg: dict, client: ShopifyClient = None, from_api: bool = False) 
         logger.info("Parsing Shopify export CSV: %s", cfg["shopify_csv"])
         existing = parse_shopify_csv(cfg["shopify_csv"], vendor_filter=cfg["vendor"])
 
-    # --- New catalogue ---
     logger.info("Parsing new catalogue: %s", cfg["catalogue_csv"])
     catalogue = parse_shopify_csv(cfg["catalogue_csv"], vendor_filter=cfg["vendor"])
 
@@ -143,6 +132,10 @@ def print_plan(plan: SyncPlan):
             print(f"  ~ {old.title}  [{diff}]")
             if diff.images_changed:
                 print(f"      images: {len(old.images)} -> {len(new.images)}")
+            if diff.added_skus:
+                print(f"      new SKUs: {', '.join(diff.added_skus)}")
+            if diff.removed_skus:
+                print(f"      removed SKUs: {', '.join(diff.removed_skus)}")
         print()
 
     if plan.unchanged:
@@ -160,6 +153,7 @@ def execute_plan(
     client: ShopifyClient,
     plan: SyncPlan,
     cfg: dict,
+    sb: SupabaseLogger = None,
     auto_tag: bool = True,
     publish: bool = True,
     set_prices: bool = True,
@@ -170,39 +164,40 @@ def execute_plan(
     """
     report = {
         "created": [],
+        "costs_set_on_new": [],
         "images_updated": [],
         "prices_updated": [],
         "costs_updated": [],
+        "variants_added": [],
         "published": [],
         "errors": [],
     }
+    sb = sb or SupabaseLogger()  # no-op if not configured
 
-    # ------- Phase 1: Create new products -------
-    created_ids = []
+    # ======= Phase 1: Create new products =======
+    created_products = []  # list of (catalogue_product, shopify_response)
     if plan.to_create:
         logger.info("Phase 1: Creating %d new products...", len(plan.to_create))
         for i, product in enumerate(plan.to_create, 1):
             logger.info("  [%d/%d] Creating: %s", i, len(plan.to_create), product.title)
 
-            # Auto-tag
             if auto_tag:
                 product.tags = generate_tags(product.title, product.tags, product.product_type)
                 logger.info("    Tags: %s", product.tags)
 
-            # Calculate retail prices from cost if no price set
             if set_prices:
                 for v in product.variants:
                     if v.cost and (not v.price or v.price == "0.00"):
                         retail = calculate_retail_price(v.cost)
                         if retail:
                             v.price = retail
-                            logger.info("    Set price for SKU %s: cost=%s -> retail=%s",
+                            logger.info("    Price for SKU %s: cost=%s -> retail=%s",
                                        v.sku, v.cost, retail)
 
             payload = product_to_shopify_payload(product)
             try:
                 created = client.create_product(payload)
-                created_ids.append(created["id"])
+                created_products.append((product, created))
                 report["created"].append({
                     "title": product.title,
                     "handle": product.handle,
@@ -210,21 +205,44 @@ def execute_plan(
                     "variants": len(created.get("variants", [])),
                     "images": len(created.get("images", [])),
                 })
+                sb.log_action("create", product.handle, product.title,
+                              shopify_id=created["id"],
+                              details={"variants": len(created.get("variants", []))})
                 logger.info("    Created (id=%s)", created["id"])
             except ShopifyAPIError as e:
                 msg = f"Failed to create {product.title}: {e}"
                 logger.error("    %s", msg)
                 report["errors"].append(msg)
+                sb.log_error(product.handle, product.title, str(e))
     else:
         logger.info("Phase 1: No new products to create.")
 
-    # ------- Phase 2: Update images -------
+    # ======= Phase 2: Set costs on newly created products =======
+    # Shopify ignores 'cost' on the variant object during creation.
+    # We must set it via PUT /inventory_items/{id}.json afterwards.
+    if created_products:
+        logger.info("Phase 2: Setting costs on %d newly created products...", len(created_products))
+        for cat_prod, shopify_prod in created_products:
+            cost_map = {v.sku: v.cost for v in cat_prod.variants if v.sku and v.cost}
+            if cost_map:
+                try:
+                    client.set_costs_on_product(shopify_prod, cost_map)
+                    report["costs_set_on_new"].append({
+                        "handle": cat_prod.handle,
+                        "skus": list(cost_map.keys()),
+                    })
+                except ShopifyAPIError as e:
+                    msg = f"Failed to set costs on {cat_prod.title}: {e}"
+                    logger.error("    %s", msg)
+                    report["errors"].append(msg)
+    else:
+        logger.info("Phase 2: No costs to set on new products.")
+
+    # ======= Phase 3: Update images =======
     image_updates = plan.to_update_images
     if image_updates:
-        logger.info("Phase 2: Updating images on %d products...", len(image_updates))
-
-        # Build handle -> Shopify ID map
-        handle_to_id = _get_handle_to_id(client, cfg, plan)
+        logger.info("Phase 3: Updating images on %d products...", len(image_updates))
+        handle_to_id = _get_handle_to_id(client, cfg)
 
         for i, (old_prod, new_prod, diff) in enumerate(image_updates, 1):
             logger.info("  [%d/%d] Updating images: %s", i, len(image_updates), old_prod.title)
@@ -242,29 +260,30 @@ def execute_plan(
                     "old_count": len(old_prod.images),
                     "new_count": len(new_prod.images),
                 })
+                sb.log_action("update_images", old_prod.handle, old_prod.title,
+                              shopify_id=product_id,
+                              details={"old": len(old_prod.images), "new": len(new_prod.images)})
                 logger.info("    Replaced %d -> %d images",
                            len(old_prod.images), len(new_prod.images))
             except ShopifyAPIError as e:
                 msg = f"Failed to update images for {old_prod.title}: {e}"
                 logger.error("    %s", msg)
                 report["errors"].append(msg)
+                sb.log_error(old_prod.handle, old_prod.title, str(e))
     else:
-        logger.info("Phase 2: No image updates needed.")
+        logger.info("Phase 3: No image updates needed.")
 
-    # ------- Phase 3: Update prices -------
+    # ======= Phase 4: Update prices =======
     price_updates = plan.to_update_prices
     if price_updates:
-        logger.info("Phase 3: Updating prices on %d products...", len(price_updates))
-
-        handle_to_id = _get_handle_to_id(client, cfg, plan)
+        logger.info("Phase 4: Updating prices on %d products...", len(price_updates))
+        handle_to_id = _get_handle_to_id(client, cfg)
 
         for i, (old_prod, new_prod, diff) in enumerate(price_updates, 1):
             logger.info("  [%d/%d] Updating prices: %s", i, len(price_updates), old_prod.title)
             product_id = old_prod.shopify_id or handle_to_id.get(old_prod.handle)
             if not product_id:
                 continue
-
-            # Match variants by SKU and update prices
             try:
                 live_product = client.get_product(product_id)
                 live_variants = {v["sku"]: v for v in live_product.get("variants", []) if v.get("sku")}
@@ -272,62 +291,115 @@ def execute_plan(
 
                 for sku, new_v in new_variant_map.items():
                     live_v = live_variants.get(sku)
-                    if live_v and new_v.price:
-                        client.update_variant(live_v["id"], {"price": new_v.price})
-                        logger.info("    Updated price for SKU %s: %s -> %s",
-                                   sku, live_v.get("price"), new_v.price)
+                    if not live_v:
+                        continue
+                    updates = {}
+                    if new_v.price:
+                        updates["price"] = new_v.price
+                    if new_v.compare_at_price:
+                        updates["compare_at_price"] = new_v.compare_at_price
+                    if updates:
+                        client.update_variant(live_v["id"], updates)
+                        logger.info("    Updated SKU %s: %s", sku, updates)
 
                 report["prices_updated"].append({
-                    "title": old_prod.title,
-                    "handle": old_prod.handle,
+                    "title": old_prod.title, "handle": old_prod.handle,
                 })
+                sb.log_action("update_prices", old_prod.handle, old_prod.title,
+                              shopify_id=product_id)
             except ShopifyAPIError as e:
                 msg = f"Failed to update prices for {old_prod.title}: {e}"
                 logger.error("    %s", msg)
                 report["errors"].append(msg)
     else:
-        logger.info("Phase 3: No price updates needed.")
+        logger.info("Phase 4: No price updates needed.")
 
-    # ------- Phase 4: Update costs -------
+    # ======= Phase 5: Update costs =======
     cost_updates = plan.to_update_costs
     if cost_updates:
-        logger.info("Phase 4: Updating costs on %d products...", len(cost_updates))
-
-        handle_to_id = _get_handle_to_id(client, cfg, plan)
+        logger.info("Phase 5: Updating costs on %d products...", len(cost_updates))
+        handle_to_id = _get_handle_to_id(client, cfg)
 
         for i, (old_prod, new_prod, diff) in enumerate(cost_updates, 1):
             logger.info("  [%d/%d] Updating costs: %s", i, len(cost_updates), old_prod.title)
             product_id = old_prod.shopify_id or handle_to_id.get(old_prod.handle)
             if not product_id:
                 continue
-
             try:
                 live_product = client.get_product(product_id)
-                live_variants = {v["sku"]: v for v in live_product.get("variants", []) if v.get("sku")}
-                new_variant_map = {v.sku: v for v in new_prod.variants if v.sku}
-
-                for sku, new_v in new_variant_map.items():
-                    live_v = live_variants.get(sku)
-                    if live_v and new_v.cost:
-                        inv_id = live_v.get("inventory_item_id")
-                        if inv_id:
-                            client.update_inventory_item_cost(inv_id, new_v.cost)
-                            logger.info("    Updated cost for SKU %s: -> %s", sku, new_v.cost)
-
+                cost_map = {v.sku: v.cost for v in new_prod.variants if v.sku and v.cost}
+                client.set_costs_on_product(live_product, cost_map)
                 report["costs_updated"].append({
-                    "title": old_prod.title,
-                    "handle": old_prod.handle,
+                    "title": old_prod.title, "handle": old_prod.handle,
                 })
+                sb.log_action("update_costs", old_prod.handle, old_prod.title,
+                              shopify_id=product_id)
             except ShopifyAPIError as e:
                 msg = f"Failed to update costs for {old_prod.title}: {e}"
                 logger.error("    %s", msg)
                 report["errors"].append(msg)
     else:
-        logger.info("Phase 4: No cost updates needed.")
+        logger.info("Phase 5: No cost updates needed.")
 
-    # ------- Phase 5: Publish new products -------
+    # ======= Phase 6: Add new variants to existing products =======
+    variant_additions = plan.to_add_variants
+    if variant_additions:
+        logger.info("Phase 6: Adding variants to %d products...", len(variant_additions))
+        handle_to_id = _get_handle_to_id(client, cfg)
+
+        for i, (old_prod, new_prod, diff) in enumerate(variant_additions, 1):
+            logger.info("  [%d/%d] Adding variants to: %s (SKUs: %s)",
+                       i, len(variant_additions), old_prod.title,
+                       ", ".join(diff.added_skus))
+            product_id = old_prod.shopify_id or handle_to_id.get(old_prod.handle)
+            if not product_id:
+                continue
+
+            new_variant_map = {v.sku: v for v in new_prod.variants if v.sku}
+            added_count = 0
+            for sku in diff.added_skus:
+                variant = new_variant_map.get(sku)
+                if not variant:
+                    continue
+
+                if set_prices and variant.cost and (not variant.price or variant.price == "0.00"):
+                    retail = calculate_retail_price(variant.cost)
+                    if retail:
+                        variant.price = retail
+
+                try:
+                    payload = variant_to_shopify_payload(variant)
+                    created_v = client.create_variant(product_id, payload)
+
+                    # Set cost on the new variant's inventory item
+                    if variant.cost and created_v.get("inventory_item_id"):
+                        client.update_inventory_item_cost(
+                            created_v["inventory_item_id"], variant.cost)
+
+                    added_count += 1
+                    logger.info("    Added variant SKU=%s (id=%s)", sku, created_v["id"])
+                except ShopifyAPIError as e:
+                    msg = f"Failed to add variant {sku} to {old_prod.title}: {e}"
+                    logger.error("    %s", msg)
+                    report["errors"].append(msg)
+
+            if added_count:
+                report["variants_added"].append({
+                    "title": old_prod.title,
+                    "handle": old_prod.handle,
+                    "skus_added": diff.added_skus,
+                    "count": added_count,
+                })
+                sb.log_action("add_variants", old_prod.handle, old_prod.title,
+                              shopify_id=product_id,
+                              details={"skus": diff.added_skus})
+    else:
+        logger.info("Phase 6: No variants to add.")
+
+    # ======= Phase 7: Publish new products =======
+    created_ids = [c["shopify_id"] for c in report["created"]]
     if publish and created_ids:
-        logger.info("Phase 5: Publishing %d new products to Online Store...", len(created_ids))
+        logger.info("Phase 7: Publishing %d new products to Online Store...", len(created_ids))
         try:
             count = client.publish_products_to_online_store(created_ids)
             report["published"] = [{"count": count, "total": len(created_ids)}]
@@ -337,7 +409,21 @@ def execute_plan(
             logger.error("    %s", msg)
             report["errors"].append(msg)
     else:
-        logger.info("Phase 5: No products to publish.")
+        logger.info("Phase 7: No products to publish.")
+
+    # ======= Phase 8: Save snapshots to Supabase =======
+    if sb.enabled and (report["created"] or report["images_updated"]):
+        logger.info("Phase 8: Saving product snapshots to Supabase...")
+        live_products = client.get_all_products(vendor=cfg["vendor"])
+        for lp in live_products:
+            sb.save_snapshot(
+                handle=lp["handle"],
+                title=lp.get("title", ""),
+                shopify_id=lp["id"],
+                image_urls=[img["src"] for img in lp.get("images", [])],
+                variant_skus=[v["sku"] for v in lp.get("variants", []) if v.get("sku")],
+                prices={v["sku"]: v["price"] for v in lp.get("variants", []) if v.get("sku")},
+            )
 
     return report
 
@@ -346,7 +432,7 @@ def execute_plan(
 _handle_id_cache: dict[str, int] | None = None
 
 
-def _get_handle_to_id(client: ShopifyClient, cfg: dict, plan: SyncPlan) -> dict[str, int]:
+def _get_handle_to_id(client: ShopifyClient, cfg: dict) -> dict[str, int]:
     """Fetch and cache handle -> Shopify product ID mapping."""
     global _handle_id_cache
     if _handle_id_cache is None:
@@ -369,6 +455,7 @@ def verify(client: ShopifyClient, cfg: dict) -> tuple[bool, dict]:
 
     missing = []
     image_mismatch = []
+    variant_mismatch = []
     verified_ok = []
 
     for handle, cat_prod in catalogue.items():
@@ -377,16 +464,29 @@ def verify(client: ShopifyClient, cfg: dict) -> tuple[bool, dict]:
             continue
 
         live = live_by_handle[handle]
+        ok = True
+
+        # Image count check
         live_img_count = len(live.get("images", []))
         cat_img_count = len(cat_prod.images)
         if live_img_count != cat_img_count:
             image_mismatch.append({
-                "handle": handle,
-                "title": cat_prod.title,
-                "shopify_images": live_img_count,
-                "catalogue_images": cat_img_count,
+                "handle": handle, "title": cat_prod.title,
+                "shopify_images": live_img_count, "catalogue_images": cat_img_count,
             })
-        else:
+            ok = False
+
+        # Variant count check
+        live_sku_count = len([v for v in live.get("variants", []) if v.get("sku")])
+        cat_sku_count = len([v for v in cat_prod.variants if v.sku])
+        if live_sku_count != cat_sku_count:
+            variant_mismatch.append({
+                "handle": handle, "title": cat_prod.title,
+                "shopify_variants": live_sku_count, "catalogue_variants": cat_sku_count,
+            })
+            ok = False
+
+        if ok:
             verified_ok.append(handle)
 
     print("\n" + "=" * 60)
@@ -409,10 +509,15 @@ def verify(client: ShopifyClient, cfg: dict) -> tuple[bool, dict]:
         print(f"\n  IMAGE MISMATCH on {len(image_mismatch)} products:")
         for m in image_mismatch[:20]:
             print(f"      - {m['handle']}: Shopify={m['shopify_images']}, catalogue={m['catalogue_images']}")
-        if len(image_mismatch) > 20:
-            print(f"      ... and {len(image_mismatch) - 20} more")
     else:
         print("  Image counts match for all products.")
+
+    if variant_mismatch:
+        print(f"\n  VARIANT MISMATCH on {len(variant_mismatch)} products:")
+        for m in variant_mismatch[:20]:
+            print(f"      - {m['handle']}: Shopify={m['shopify_variants']}, catalogue={m['catalogue_variants']}")
+    else:
+        print("  Variant counts match for all products.")
 
     print(f"\n  Verified OK: {len(verified_ok)}")
     print("=" * 60 + "\n")
@@ -422,10 +527,11 @@ def verify(client: ShopifyClient, cfg: dict) -> tuple[bool, dict]:
         "live_count": len(live_products),
         "missing": missing,
         "image_mismatch": image_mismatch,
+        "variant_mismatch": variant_mismatch,
         "verified_ok_count": len(verified_ok),
     }
 
-    ok = len(missing) == 0 and len(image_mismatch) == 0
+    ok = len(missing) == 0 and len(image_mismatch) == 0 and len(variant_mismatch) == 0
     return ok, report
 
 
@@ -455,6 +561,8 @@ def main():
                       help="Only compare catalogues and print the diff.")
     mode.add_argument("--verify", action="store_true",
                       help="Verify Shopify matches the catalogue (read-only).")
+    mode.add_argument("--setup-supabase", action="store_true",
+                      help="Print SQL to create Supabase tables, then exit.")
 
     # Behaviour flags
     parser.add_argument("--yes", "-y", action="store_true",
@@ -476,6 +584,14 @@ def main():
     parser.add_argument("--vendor", help="Override vendor name filter.")
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Setup mode
+    # ------------------------------------------------------------------
+    if args.setup_supabase:
+        print_setup_sql()
+        return
+
     cfg = load_config()
 
     if args.shopify_csv:
@@ -542,10 +658,16 @@ def main():
     global _handle_id_cache
     _handle_id_cache = None
 
+    # Initialize Supabase logger
+    sb = SupabaseLogger()
+    sb.start_run(
+        action="live-sync",
+        vendor=cfg["vendor"],
+        catalogue_path=cfg["catalogue_csv"],
+    )
+
     report = execute_plan(
-        client,
-        plan,
-        cfg,
+        client, plan, cfg, sb=sb,
         auto_tag=not args.no_tags,
         publish=not args.no_publish,
         set_prices=not args.no_prices,
@@ -564,8 +686,8 @@ def main():
         logger.warning("Sync complete but verification found discrepancies.")
 
     write_report(report, args.report)
+    sb.finish_run(report["status"], report)
 
-    # Exit with error code if verification failed (useful for CI)
     if not ok:
         sys.exit(1)
 

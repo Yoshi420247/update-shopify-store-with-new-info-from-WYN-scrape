@@ -203,12 +203,24 @@ class ShopifyClient:
     # Variant operations
     # ------------------------------------------------------------------
 
+    def create_variant(self, product_id: int, variant_payload: dict) -> dict:
+        """Add a new variant to an existing product."""
+        resp = self._post(f"products/{product_id}/variants.json", {"variant": variant_payload})
+        variant = resp.json()["variant"]
+        logger.info("Created variant (id=%s, sku=%s) on product %d",
+                     variant["id"], variant.get("sku"), product_id)
+        return variant
+
     def update_variant(self, variant_id: int, updates: dict) -> dict:
         resp = self._put(f"variants/{variant_id}.json", {"variant": updates})
         return resp.json()["variant"]
 
+    def delete_variant(self, product_id: int, variant_id: int):
+        self._delete(f"products/{product_id}/variants/{variant_id}.json")
+        logger.info("Deleted variant %d from product %d", variant_id, product_id)
+
     # ------------------------------------------------------------------
-    # Inventory / cost operations
+    # Inventory operations
     # ------------------------------------------------------------------
 
     def get_inventory_item(self, inventory_item_id: int) -> dict:
@@ -221,6 +233,44 @@ class ShopifyClient:
             {"inventory_item": {"cost": cost}},
         )
         return resp.json()["inventory_item"]
+
+    def get_inventory_levels(self, inventory_item_id: int) -> list[dict]:
+        resp = self._get("inventory_levels.json", params={"inventory_item_ids": inventory_item_id})
+        return resp.json().get("inventory_levels", [])
+
+    def set_inventory_level(self, inventory_item_id: int, location_id: int, available: int) -> dict:
+        resp = self._post("inventory_levels/set.json", {
+            "inventory_item_id": inventory_item_id,
+            "location_id": location_id,
+            "available": available,
+        })
+        return resp.json().get("inventory_level", {})
+
+    def get_locations(self) -> list[dict]:
+        """Fetch all locations for the store."""
+        return list(self._paginate("locations.json", "locations"))
+
+    def set_costs_on_product(self, product: dict, cost_map: dict[str, str]):
+        """
+        Set cost on inventory items for a product's variants.
+        cost_map: {sku: cost_string}
+        """
+        for variant in product.get("variants", []):
+            sku = variant.get("sku", "")
+            cost = cost_map.get(sku)
+            if cost and variant.get("inventory_item_id"):
+                self.update_inventory_item_cost(variant["inventory_item_id"], cost)
+                logger.info("Set cost %s on SKU %s (inv_item=%d)",
+                           cost, sku, variant["inventory_item_id"])
+
+    def enable_inventory_tracking(self, product: dict):
+        """
+        Enable Shopify inventory tracking on all variants of a product
+        and set their inventory_management to 'shopify'.
+        """
+        for variant in product.get("variants", []):
+            if variant.get("inventory_management") != "shopify":
+                self.update_variant(variant["id"], {"inventory_management": "shopify"})
 
     # ------------------------------------------------------------------
     # Publishing (GraphQL)

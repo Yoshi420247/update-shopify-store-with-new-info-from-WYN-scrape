@@ -64,6 +64,8 @@ jobs:
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
           WYN_CATALOGUE_CSV: ${{ github.event.inputs.catalogue_csv }}
           VENDOR_NAME: "What You Need"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           # Build the command
           CMD="python sync.py --yes --report sync_report.json"

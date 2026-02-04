@@ -95,6 +95,8 @@ Actions tab with these inputs:
 
 **Required secrets**: `SHOPIFY_STORE`, `SHOPIFY_ACCESS_TOKEN`
 
+**Optional secrets** (for audit logging): `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`
+
 Artifacts uploaded after each run: `sync_report.json` and `logs/`.
 
 ## What it does
@@ -114,17 +116,20 @@ Artifacts uploaded after each run: `sync_report.json` and `logs/`.
               ┌────────────┼────────────┐
               ▼            ▼            ▼
          New items    Changed      Unchanged
-                    (img/price/cost)
+                   (img/price/cost/variants)
               │            │
               ▼            ▼
-         Create via    Update images
-         POST API      Update prices
-         Auto-tag      Update costs
-         Set 2x price
+         1. Create     3. Update images
+         2. Set costs  4. Update prices
+            Auto-tag   5. Update costs
+            2x price   6. Add new variants
               │            │
               └─────┬──────┘
                     ▼
-           Publish to Online Store
+           7. Publish to Online Store
+                    │
+                    ▼
+           8. Save Supabase snapshots
                     │
                     ▼
             Verify all products
@@ -150,3 +155,24 @@ These tags drive Shopify smart-collection auto-sorting.
 ## Pricing
 
 New products without a price get retail = cost x 2 (standard Oil Slick markup).
+
+## Supabase audit logging (optional)
+
+If you have a Supabase project, you can enable audit logging to track every
+sync run and per-product action.
+
+### Setup
+
+1. Print the table-creation SQL:
+   ```bash
+   python sync.py --setup-supabase
+   ```
+2. Run the SQL in your Supabase project's SQL Editor.
+3. Add credentials to `.env`:
+   ```
+   SUPABASE_URL=https://your-project.supabase.co
+   SUPABASE_SERVICE_KEY=eyJ...
+   ```
+
+The tool works identically without Supabase — all logging methods silently
+no-op if credentials are missing.

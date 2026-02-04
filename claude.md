@@ -21,7 +21,19 @@ sync.py           Main CLI orchestrator (dry-run / live / verify / compare-only)
 shopify_api.py    Shopify Admin REST + GraphQL client
 catalogue.py      CSV parser, API-to-internal converter, comparison engine
 tags.py           Auto-tagging engine (Oil Slick taxonomy from collection strategy)
+supabase_log.py   Supabase audit logging + product state snapshots (optional)
 ```
+
+### Execution phases (live sync)
+
+1. **Create new products** — auto-tags, 2x pricing, `inventory_management: "shopify"`
+2. **Set costs on new products** — via `PUT /inventory_items/{id}.json` (Shopify ignores cost during creation)
+3. **Update images** — delete existing + re-upload if catalogue has different image URLs
+4. **Update prices** — sync price and compare_at_price per variant SKU
+5. **Update costs** — sync wholesale cost on existing products via Inventory Items API
+6. **Add new variants** — add variants with new SKUs to existing products, then set their costs
+7. **Publish to Online Store** — via GraphQL `publishablePublish` mutation
+8. **Save Supabase snapshots** — store current product state for faster future diffs
 
 ### Key design decisions
 
@@ -60,6 +72,7 @@ python sync.py --verify                      # check store matches catalogue
 
 Trigger the **"Sync WYN Products to Shopify"** workflow from the Actions tab.
 Secrets required: `SHOPIFY_STORE`, `SHOPIFY_ACCESS_TOKEN`.
+Optional secrets for audit logging: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`.
 
 Inputs:
 - **action**: dry-run | live-sync | compare-only | verify
@@ -95,6 +108,28 @@ allowed for material and style.
 - `Yoshi420247/makeAIproductdescription` — AI product description generator
   (can be run after this sync to generate descriptions for new products)
 
+## Supabase integration (optional)
+
+If `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are set, the tool logs every sync
+run and per-product action to Supabase for audit trail and state tracking.
+
+### Setup
+
+1. Run `python sync.py --setup-supabase` to print the table-creation SQL.
+2. Paste the SQL into the Supabase SQL Editor and run it.
+3. Add `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` to `.env` (or GitHub Actions secrets).
+
+### Tables
+
+| Table | Purpose |
+|-------|---------|
+| `sync_runs` | One row per sync invocation (status, timestamps, summary) |
+| `sync_actions` | One row per product-level action (create, update_images, error, etc.) |
+| `product_snapshots` | Latest known state of each product (handle, images, prices) |
+
+If Supabase is not configured, `SupabaseLogger` methods silently no-op and
+the tool works exactly the same without any logging.
+
 ## File layout
 
 ```
@@ -113,6 +148,7 @@ allowed for material and style.
 ├── README.md                    User-facing documentation
 ├── requirements.txt             Python dependencies
 ├── shopify_api.py               Shopify REST + GraphQL client
+├── supabase_log.py              Supabase audit logger (optional)
 ├── sync.py                      Main entry point
 └── tags.py                      Auto-tagging engine
 ```
