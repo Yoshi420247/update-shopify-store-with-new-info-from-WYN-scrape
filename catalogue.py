@@ -71,7 +71,8 @@ def _normalise_key(col: str) -> str:
     return " ".join(col.strip().lower().split())
 
 
-def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, Product]:
+def parse_shopify_csv(path: str | Path, vendor_filter: str = None,
+                      swap_price_cost: bool = False) -> dict[str, Product]:
     """
     Parse a Shopify product-export CSV into a dict keyed by handle.
 
@@ -79,6 +80,11 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, 
     - The first row for a product carries the Title, Handle, Body, etc.
     - Subsequent rows for the same product have blank Title/Handle and
       carry additional variants and/or images.
+
+    If swap_price_cost is True, the "Variant Price" column is treated as
+    the wholesale cost and "Cost per item" is treated as the retail price.
+    This is needed for WYN catalogues where the columns are inverted
+    relative to Shopify's convention.
 
     Returns {handle: Product}.
     """
@@ -133,14 +139,25 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, 
                 prod.image_alts.append(g(row, "image alt text"))
 
             sku = g(row, "variant sku")
-            price = g(row, "variant price")
-            if sku or price:
+            csv_price = g(row, "variant price")
+            csv_cost = g(row, "cost per item")
+
+            # WYN catalogues have columns inverted: "Variant Price" is
+            # actually wholesale cost, "Cost per item" is the retail price.
+            if swap_price_cost:
+                price = csv_cost   # retail price
+                cost = csv_price   # wholesale cost
+            else:
+                price = csv_price
+                cost = csv_cost
+
+            if sku or price or csv_price:
                 prod.variants.append(
                     Variant(
                         sku=sku,
                         price=price,
                         compare_at_price=g(row, "variant compare at price"),
-                        cost=g(row, "cost per item"),
+                        cost=cost,
                         option1_name=g(row, "option1 name"),
                         option1_value=g(row, "option1 value"),
                         option2_name=g(row, "option2 name"),

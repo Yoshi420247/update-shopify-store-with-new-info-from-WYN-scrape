@@ -103,7 +103,8 @@ def build_plan(cfg: dict, client: ShopifyClient = None, from_api: bool = False) 
         existing = parse_shopify_csv(cfg["shopify_csv"], vendor_filter=cfg["vendor"])
 
     logger.info("Parsing new catalogue: %s", cfg["catalogue_csv"])
-    catalogue = parse_shopify_csv(cfg["catalogue_csv"], vendor_filter=cfg["vendor"])
+    catalogue = parse_shopify_csv(cfg["catalogue_csv"], vendor_filter=cfg["vendor"],
+                                  swap_price_cost=True)
 
     logger.info("Comparing %d existing vs %d catalogue products...",
                 len(existing), len(catalogue))
@@ -187,7 +188,7 @@ def execute_plan(
 
             if set_prices:
                 for v in product.variants:
-                    if v.cost and (not v.price or v.price == "0.00"):
+                    if v.cost:
                         retail = calculate_retail_price(v.cost)
                         if retail:
                             v.price = retail
@@ -294,7 +295,12 @@ def execute_plan(
                     if not live_v:
                         continue
                     updates = {}
-                    if new_v.price:
+                    # Always derive retail price from cost × 2
+                    if set_prices and new_v.cost:
+                        retail = calculate_retail_price(new_v.cost)
+                        if retail:
+                            updates["price"] = retail
+                    elif new_v.price:
                         updates["price"] = new_v.price
                     if new_v.compare_at_price:
                         updates["compare_at_price"] = new_v.compare_at_price
@@ -329,6 +335,18 @@ def execute_plan(
                 live_product = client.get_product(product_id)
                 cost_map = {v.sku: v.cost for v in new_prod.variants if v.sku and v.cost}
                 client.set_costs_on_product(live_product, cost_map)
+
+                # When cost changes, recalculate retail price = cost × 2
+                if set_prices:
+                    live_variants = {v["sku"]: v for v in live_product.get("variants", []) if v.get("sku")}
+                    for sku, cost in cost_map.items():
+                        retail = calculate_retail_price(cost)
+                        live_v = live_variants.get(sku)
+                        if retail and live_v:
+                            client.update_variant(live_v["id"], {"price": retail})
+                            logger.info("    Updated retail price for SKU %s: cost=%s -> retail=%s",
+                                       sku, cost, retail)
+
                 report["costs_updated"].append({
                     "title": old_prod.title, "handle": old_prod.handle,
                 })
@@ -362,7 +380,7 @@ def execute_plan(
                 if not variant:
                     continue
 
-                if set_prices and variant.cost and (not variant.price or variant.price == "0.00"):
+                if set_prices and variant.cost:
                     retail = calculate_retail_price(variant.cost)
                     if retail:
                         variant.price = retail
@@ -451,7 +469,8 @@ def verify(client: ShopifyClient, cfg: dict) -> tuple[bool, dict]:
     live_by_handle = {p["handle"]: p for p in live_products}
 
     logger.info("Verification: parsing catalogue...")
-    catalogue = parse_shopify_csv(cfg["catalogue_csv"], vendor_filter=cfg["vendor"])
+    catalogue = parse_shopify_csv(cfg["catalogue_csv"], vendor_filter=cfg["vendor"],
+                                  swap_price_cost=True)
 
     missing = []
     image_mismatch = []

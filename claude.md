@@ -49,8 +49,14 @@ supabase_log.py   Supabase audit logging + product state snapshots (optional)
 - **Auto-tagging** uses regex keyword matching on product titles to assign
   `family:`, `pillar:`, `use:`, `material:`, `brand:`, `style:`, `joint_size:`,
   and `joint_gender:` tags.  These tags drive smart-collection auto-sorting.
-- **Pricing** follows the 2x cost markup rule established across the Oil Slick
-  tooling.  Retail = cost * 2.
+- **Pricing** follows the 2x cost markup rule: Shopify retail price = cost x 2,
+  always.  The CSV "Variant Price" column is never used as-is — retail is always
+  recalculated from cost.  When costs change on existing products, the retail
+  price is also recalculated.
+- **WYN CSV column swap** — the WYN catalogue has inverted columns: its
+  "Variant Price" is the wholesale cost and "Cost per item" is the retail.
+  The parser swaps these with `swap_price_cost=True` so internal fields are
+  correct (cost = wholesale, price = retail from cost x 2).
 - **Rate limiting** is handled with a minimum 0.55s interval between requests
   plus automatic retry on 429 responses.
 
