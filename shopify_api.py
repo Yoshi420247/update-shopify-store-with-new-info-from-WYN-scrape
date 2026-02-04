@@ -1,13 +1,14 @@
 """
-Shopify Admin REST API client.
+Shopify Admin API client (REST + GraphQL).
 
-Handles authentication, rate limiting, pagination, and all product/image
-operations needed for the WYN catalogue sync.
+Handles authentication, rate limiting, pagination, and all product/image/
+publishing operations needed for the WYN catalogue sync.
 """
 
+import json
 import time
 import logging
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
@@ -27,20 +28,22 @@ class ShopifyAPIError(Exception):
 
 class ShopifyClient:
     """
-    Thin wrapper around the Shopify Admin REST API.
+    Wrapper around the Shopify Admin REST + GraphQL APIs.
 
     Handles:
     - Authentication via access token
     - Automatic retry with back-off on 429 (rate limit) responses
     - Cursor-based pagination for listing endpoints
+    - GraphQL mutations for publishing and inventory cost updates
     """
 
     def __init__(self, store_url: str, access_token: str):
-        # Normalise store URL to just the hostname
         store_url = store_url.strip().rstrip("/")
         if store_url.startswith("http"):
             store_url = urlparse(store_url).hostname
+        self.hostname = store_url
         self.base = f"https://{store_url}/admin/api/{API_VERSION}"
+        self.graphql_url = f"https://{store_url}/admin/api/{API_VERSION}/graphql.json"
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -48,14 +51,24 @@ class ShopifyClient:
                 "Content-Type": "application/json",
             }
         )
+        # Minimum delay between requests to stay under rate limits
+        self._last_request_time = 0.0
+        self._min_interval = 0.55  # seconds
 
     # ------------------------------------------------------------------
-    # Low-level request with rate-limit handling
+    # Low-level helpers
     # ------------------------------------------------------------------
+
+    def _throttle(self):
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        self._last_request_time = time.time()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base}/{path.lstrip('/')}"
         for attempt in range(5):
+            self._throttle()
             resp = self.session.request(method, url, **kwargs)
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", 2))
@@ -80,6 +93,31 @@ class ShopifyClient:
         return self._request("DELETE", path)
 
     # ------------------------------------------------------------------
+    # GraphQL
+    # ------------------------------------------------------------------
+
+    def _graphql(self, query: str, variables: dict = None) -> dict:
+        """Execute a GraphQL query/mutation."""
+        body = {"query": query}
+        if variables:
+            body["variables"] = variables
+        for attempt in range(5):
+            self._throttle()
+            resp = self.session.post(self.graphql_url, json=body)
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", 2))
+                logger.warning("GraphQL rate limited – sleeping %.1fs (attempt %d)", retry_after, attempt + 1)
+                time.sleep(retry_after)
+                continue
+            if resp.status_code >= 400:
+                raise ShopifyAPIError(resp.status_code, resp.text)
+            data = resp.json()
+            if "errors" in data:
+                raise ShopifyAPIError(200, json.dumps(data["errors"]), "GraphQL errors")
+            return data["data"]
+        raise ShopifyAPIError(429, "GraphQL rate limit not resolved after retries")
+
+    # ------------------------------------------------------------------
     # Pagination helper
     # ------------------------------------------------------------------
 
@@ -92,15 +130,12 @@ class ShopifyClient:
             data = resp.json()
             items = data.get(key, [])
             yield from items
-            # Follow cursor pagination via Link header
             link = resp.headers.get("Link", "")
             if 'rel="next"' not in link:
                 break
-            # Extract the next page URL
             for part in link.split(","):
                 if 'rel="next"' in part:
                     next_url = part.split("<")[1].split(">")[0]
-                    # Extract page_info param
                     qs = parse_qs(urlparse(next_url).query)
                     params = {"limit": params["limit"], "page_info": qs["page_info"][0]}
                     break
@@ -157,11 +192,7 @@ class ShopifyClient:
         logger.info("Deleted image %d from product %d", image_id, product_id)
 
     def replace_product_images(self, product_id: int, new_image_urls: list[str]):
-        """
-        Delete all existing images on a product, then upload the new ones
-        in order.  This is the safest way to guarantee images match the
-        catalogue exactly.
-        """
+        """Delete all existing images then upload new ones in order."""
         existing = self.get_product_images(product_id)
         for img in existing:
             self.delete_product_image(product_id, img["id"])
@@ -175,6 +206,99 @@ class ShopifyClient:
     def update_variant(self, variant_id: int, updates: dict) -> dict:
         resp = self._put(f"variants/{variant_id}.json", {"variant": updates})
         return resp.json()["variant"]
+
+    # ------------------------------------------------------------------
+    # Inventory / cost operations
+    # ------------------------------------------------------------------
+
+    def get_inventory_item(self, inventory_item_id: int) -> dict:
+        resp = self._get(f"inventory_items/{inventory_item_id}.json")
+        return resp.json()["inventory_item"]
+
+    def update_inventory_item_cost(self, inventory_item_id: int, cost: str) -> dict:
+        resp = self._put(
+            f"inventory_items/{inventory_item_id}.json",
+            {"inventory_item": {"cost": cost}},
+        )
+        return resp.json()["inventory_item"]
+
+    # ------------------------------------------------------------------
+    # Publishing (GraphQL)
+    # ------------------------------------------------------------------
+
+    def get_publication_ids(self) -> list[dict]:
+        """Fetch all publications (sales channels) for the store."""
+        query = """
+        {
+            publications(first: 20) {
+                edges {
+                    node {
+                        id
+                        name
+                    }
+                }
+            }
+        }
+        """
+        data = self._graphql(query)
+        pubs = []
+        for edge in data["publications"]["edges"]:
+            pubs.append({"id": edge["node"]["id"], "name": edge["node"]["name"]})
+        return pubs
+
+    def publish_product(self, product_id: int, publication_id: str) -> bool:
+        """Publish a product to a sales channel using GraphQL."""
+        gid = f"gid://shopify/Product/{product_id}"
+        query = """
+        mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+            publishablePublish(id: $id, input: $input) {
+                publishable {
+                    availablePublicationsCount {
+                        count
+                    }
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+        variables = {
+            "id": gid,
+            "input": [{"publicationId": publication_id}],
+        }
+        data = self._graphql(query, variables)
+        errors = data["publishablePublish"]["userErrors"]
+        if errors:
+            logger.error("Publish errors for product %d: %s", product_id, errors)
+            return False
+        logger.info("Published product %d to %s", product_id, publication_id)
+        return True
+
+    def publish_products_to_online_store(self, product_ids: list[int]) -> int:
+        """
+        Publish a list of products to the Online Store channel.
+        Returns count of successfully published products.
+        """
+        pubs = self.get_publication_ids()
+        online_store = next((p for p in pubs if "online store" in p["name"].lower()), None)
+        if not online_store:
+            logger.error("Could not find Online Store publication. Available: %s",
+                         [p["name"] for p in pubs])
+            return 0
+
+        pub_id = online_store["id"]
+        logger.info("Publishing %d products to '%s' (%s)", len(product_ids), online_store["name"], pub_id)
+
+        success = 0
+        for pid in product_ids:
+            try:
+                if self.publish_product(pid, pub_id):
+                    success += 1
+            except ShopifyAPIError as e:
+                logger.error("Failed to publish product %d: %s", pid, e)
+        return success
 
     # ------------------------------------------------------------------
     # Connection test

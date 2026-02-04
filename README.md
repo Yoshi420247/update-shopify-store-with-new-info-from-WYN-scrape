@@ -1,9 +1,9 @@
-# WYN → Shopify Product Sync
+# WYN -> Shopify Product Sync
 
-Syncs the "What You Need" vendor catalogue with a Shopify store. Compares a
-new catalogue CSV against your current Shopify product export to determine
-what needs to be created, what needs updated images, and what is unchanged —
-then executes those changes via the Shopify Admin API.
+Syncs the "What You Need" vendor catalogue with a Shopify store. Compares the
+new catalogue against current Shopify products (via API or CSV export), then
+creates missing products, replaces updated images, syncs prices/costs, auto-tags
+for collection sorting, and publishes to the Online Store.
 
 ## Setup
 
@@ -15,105 +15,138 @@ cp .env.example .env
 
 ### Shopify API credentials
 
-1. In Shopify Admin, go to **Settings → Apps and sales channels → Develop apps**
+1. In Shopify Admin, go to **Settings > Apps and sales channels > Develop apps**
 2. Create a custom app with these **Admin API scopes**:
-   - `read_products`
-   - `write_products`
+   - `read_products`, `write_products`
+   - `read_inventory`, `write_inventory`
+   - `read_publications`, `write_publications`
 3. Install the app and copy the Admin API access token into `.env`
 
 ### Data files
 
-Place two CSVs in the `data/` directory:
+Place the new WYN catalogue CSV in `data/wyn_catalogue.csv` (standard Shopify
+product export format).
 
-| File | Description |
-|------|-------------|
-| `data/shopify_export.csv` | Current Shopify product export (Admin → Products → Export) |
-| `data/wyn_catalogue.csv` | New WYN catalogue (same Shopify CSV format) |
+If using `--from-api` (recommended), no Shopify export CSV is needed — the
+tool fetches current state directly from the Shopify Admin API.
 
 ## Usage
 
-### 1. Compare catalogues (no API calls)
+### Compare (no changes made)
 
 ```bash
+# Using live API data (recommended):
+python sync.py --from-api --compare-only
+
+# Using a Shopify export CSV:
 python sync.py --compare-only
 ```
 
-Shows a report of what would be created, updated, or left alone.
-
-### 2. Dry run (default)
+### Dry run (default)
 
 ```bash
-python sync.py
+python sync.py --from-api
 ```
 
-Parses both CSVs and prints the plan, but makes no changes.
+Prints the sync plan but makes no changes.
 
-### 3. Live sync
+### Live sync
 
 ```bash
-python sync.py --live
+python sync.py --from-api --live
+
+# Skip interactive confirmation (for CI/automation):
+python sync.py --from-api --live --yes
 ```
 
-Executes the sync: creates new products, replaces images on updated products,
-then runs a verification pass.
+Creates new products, replaces images, updates prices/costs, auto-tags, and
+publishes to the Online Store. Then runs a verification pass.
 
-### 4. Verify
+### Verify
 
 ```bash
 python sync.py --verify
 ```
 
-Checks that every product in the catalogue exists in Shopify with the correct
-image count. Read-only API calls.
+Checks that every catalogue product exists in Shopify with correct image counts.
 
-### CLI overrides
-
-```
---shopify-csv PATH    Override the Shopify export CSV path
---catalogue-csv PATH  Override the new catalogue CSV path
---vendor NAME         Override the vendor name filter
-```
-
-## How it works
+### Feature flags
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│ shopify_export   │     │ wyn_catalogue    │
-│    .csv          │     │    .csv          │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         └───────┐   ┌──────────┘
-                 ▼   ▼
-          ┌──────────────┐
-          │  Compare by  │
-          │   handle     │
-          └──────┬───────┘
-                 │
-        ┌────────┼────────┐
-        ▼        ▼        ▼
-   New items  Changed   Unchanged
-              images
-        │        │
-        ▼        ▼
-   POST create  DELETE old images
-   /products    POST new images
-        │        │
-        └────┬───┘
-             ▼
-       Verify all products
-       match catalogue
+--no-tags       Don't auto-tag new products
+--no-publish    Don't publish new products to Online Store
+--no-prices     Don't calculate retail prices from costs
+--report PATH   Custom path for JSON report output
 ```
 
-**Matching**: Products are matched by their `Handle` (the URL slug). This is
-the most reliable identifier across Shopify exports.
+## GitHub Actions
 
-**Image comparison**: Image URLs are compared after stripping query parameters
-(Shopify CDN adds cache-busters like `?v=123456`). If the base URLs differ,
-images are replaced.
+The workflow **"Sync WYN Products to Shopify"** can be triggered from the
+Actions tab with these inputs:
 
-**Safety**: Dry-run is the default. Live mode requires `--live` flag and an
-interactive confirmation prompt before making any changes.
+| Input | Options | Default |
+|-------|---------|---------|
+| action | dry-run, live-sync, compare-only, verify | dry-run |
+| source | from-api, from-csv | from-api |
+| catalogue_csv | path to CSV in repo | data/wyn_catalogue.csv |
+| auto_tag | true/false | true |
+| publish | true/false | true |
+| set_prices | true/false | true |
 
-## Logs
+**Required secrets**: `SHOPIFY_STORE`, `SHOPIFY_ACCESS_TOKEN`
 
-Every run writes a timestamped log to `logs/`.
+Artifacts uploaded after each run: `sync_report.json` and `logs/`.
+
+## What it does
+
+```
+                    ┌─────────────┐
+                    │ Shopify API │  (--from-api)
+                    │  or CSV     │  (default)
+                    └──────┬──────┘
+                           │
+  ┌──────────────┐         │
+  │ WYN catalogue│─────────┤
+  │    .csv      │         │
+  └──────────────┘    Compare by
+                       handle
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+         New items    Changed      Unchanged
+                    (img/price/cost)
+              │            │
+              ▼            ▼
+         Create via    Update images
+         POST API      Update prices
+         Auto-tag      Update costs
+         Set 2x price
+              │            │
+              └─────┬──────┘
+                    ▼
+           Publish to Online Store
+                    │
+                    ▼
+            Verify all products
+            Write JSON report
+```
+
+## Auto-tagging
+
+New products are automatically tagged with the Oil Slick taxonomy based on
+keyword matching in the title:
+
+| Namespace | Example tags |
+|-----------|-------------|
+| `family:` | `glass-bong`, `grinder`, `dab-tool` |
+| `pillar:` | `smokeshop-device`, `accessory` |
+| `use:` | `flower-smoking`, `dabbing`, `rolling` |
+| `material:` | `glass`, `silicone`, `quartz` |
+| `brand:` | `raw`, `cookies`, `zig-zag` |
+| `style:` | `animal`, `character`, `halloween` |
+
+These tags drive Shopify smart-collection auto-sorting.
+
+## Pricing
+
+New products without a price get retail = cost x 2 (standard Oil Slick markup).

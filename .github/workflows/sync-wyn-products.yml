@@ -1,0 +1,122 @@
+name: Sync WYN Products to Shopify
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - live-sync
+          - compare-only
+          - verify
+        default: dry-run
+      source:
+        description: "Source for current Shopify state"
+        required: true
+        type: choice
+        options:
+          - from-api
+          - from-csv
+        default: from-api
+      catalogue_csv:
+        description: "Path to new catalogue CSV (relative to repo root)"
+        required: false
+        default: "data/wyn_catalogue.csv"
+      auto_tag:
+        description: "Auto-tag new products with Oil Slick taxonomy"
+        required: false
+        type: boolean
+        default: true
+      publish:
+        description: "Publish new products to Online Store"
+        required: false
+        type: boolean
+        default: true
+      set_prices:
+        description: "Calculate retail prices (2x cost) for new products"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          WYN_CATALOGUE_CSV: ${{ github.event.inputs.catalogue_csv }}
+          VENDOR_NAME: "What You Need"
+        run: |
+          # Build the command
+          CMD="python sync.py --yes --report sync_report.json"
+
+          # Action mode
+          case "${{ github.event.inputs.action }}" in
+            live-sync)   CMD="$CMD --live" ;;
+            compare-only) CMD="$CMD --compare-only" ;;
+            verify)      CMD="$CMD --verify" ;;
+            dry-run)     ;; # default (no --live flag)
+          esac
+
+          # Source
+          if [ "${{ github.event.inputs.source }}" = "from-api" ]; then
+            CMD="$CMD --from-api"
+          fi
+
+          # Feature flags
+          if [ "${{ github.event.inputs.auto_tag }}" = "false" ]; then
+            CMD="$CMD --no-tags"
+          fi
+          if [ "${{ github.event.inputs.publish }}" = "false" ]; then
+            CMD="$CMD --no-publish"
+          fi
+          if [ "${{ github.event.inputs.set_prices }}" = "false" ]; then
+            CMD="$CMD --no-prices"
+          fi
+
+          echo "Running: $CMD"
+          $CMD
+
+      - name: Upload sync report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-report-${{ github.run_id }}
+          path: sync_report.json
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
+
+      - name: Print report summary
+        if: always()
+        run: |
+          if [ -f sync_report.json ]; then
+            echo "=== SYNC REPORT ==="
+            python -m json.tool sync_report.json
+          else
+            echo "No report generated."
+          fi

@@ -14,6 +14,9 @@ build/
 .venv/
 venv/
 
+# Reports
+sync_report.json
+
 # Logs
 logs/
 *.log

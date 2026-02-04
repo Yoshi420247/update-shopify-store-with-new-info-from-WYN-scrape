@@ -2,8 +2,9 @@
 Shopify CSV catalogue parser and comparison engine.
 
 Parses standard Shopify product-export CSVs (where one product can span
-multiple rows for variants and images) and compares two catalogues to
-determine what needs to be created, updated, or left alone.
+multiple rows for variants and images), converts live API product dicts
+into the same format, and compares two catalogues to determine what needs
+to be created, updated, or left alone.
 """
 
 import csv
@@ -38,6 +39,9 @@ class Variant:
     requires_shipping: str = ""
     taxable: str = ""
     variant_image: str = ""
+    # Set when loaded from API (needed for updates)
+    shopify_variant_id: int | None = None
+    shopify_inventory_item_id: int | None = None
 
 
 @dataclass
@@ -53,7 +57,8 @@ class Product:
     images: list[str] = field(default_factory=list)
     image_alts: list[str] = field(default_factory=list)
     variants: list[Variant] = field(default_factory=list)
-    # Preserve all raw rows for any columns we don't explicitly model
+    # Set when loaded from API
+    shopify_id: int | None = None
     _raw_rows: list[dict] = field(default_factory=list, repr=False)
 
 
@@ -86,19 +91,15 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, 
 
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        # Build a normalised-key -> original-key map so we tolerate
-        # slight header variations between exports.
         field_map = {_normalise_key(c): c for c in reader.fieldnames} if reader.fieldnames else {}
 
         def g(row: dict, normalised_name: str) -> str:
-            """Get a value from row using a normalised column name."""
             original = field_map.get(normalised_name, "")
             return (row.get(original) or "").strip()
 
         for row in reader:
             handle = g(row, "handle")
 
-            # Continuation row (variant / extra image for current product)
             if not handle:
                 handle = current_handle
             if not handle:
@@ -106,13 +107,11 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, 
 
             current_handle = handle
 
-            # Apply vendor filter early to skip irrelevant products
             row_vendor = g(row, "vendor")
             if vendor_filter and handle not in products and row_vendor:
                 if row_vendor.lower() != vendor_filter.lower():
                     continue
 
-            # First time seeing this handle → create product
             if handle not in products:
                 products[handle] = Product(
                     handle=handle,
@@ -128,13 +127,11 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, 
             prod = products[handle]
             prod._raw_rows.append(row)
 
-            # Collect images (skip blanks and duplicates)
             img = g(row, "image src")
             if img and img not in prod.images:
                 prod.images.append(img)
                 prod.image_alts.append(g(row, "image alt text"))
 
-            # Collect variant
             sku = g(row, "variant sku")
             price = g(row, "variant price")
             if sku or price:
@@ -166,22 +163,133 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None) -> dict[str, 
 
 
 # ----------------------------------------------------------------------
+# Convert live API products → Product dict
+# ----------------------------------------------------------------------
+
+def products_from_api(api_products: list[dict]) -> dict[str, Product]:
+    """
+    Convert a list of Shopify API product dicts (from GET /products.json)
+    into our internal Product format keyed by handle.
+    """
+    products: dict[str, Product] = {}
+    for ap in api_products:
+        handle = ap.get("handle", "")
+        if not handle:
+            continue
+
+        images = []
+        image_alts = []
+        for img in ap.get("images", []):
+            src = img.get("src", "")
+            if src:
+                images.append(src)
+                image_alts.append(img.get("alt") or "")
+
+        variants = []
+        for av in ap.get("variants", []):
+            options = ap.get("options", [])
+            variants.append(
+                Variant(
+                    sku=av.get("sku") or "",
+                    price=str(av.get("price", "")),
+                    compare_at_price=str(av.get("compare_at_price") or ""),
+                    cost="",  # cost is on inventory_item, not available here
+                    option1_name=options[0]["name"] if len(options) > 0 else "",
+                    option1_value=av.get("option1") or "",
+                    option2_name=options[1]["name"] if len(options) > 1 else "",
+                    option2_value=av.get("option2") or "",
+                    option3_name=options[2]["name"] if len(options) > 2 else "",
+                    option3_value=av.get("option3") or "",
+                    grams=str(av.get("grams", "")),
+                    weight_unit=av.get("weight_unit") or "",
+                    inventory_qty=str(av.get("inventory_quantity", "")),
+                    inventory_policy=av.get("inventory_policy") or "",
+                    barcode=av.get("barcode") or "",
+                    requires_shipping=str(av.get("requires_shipping", "")),
+                    taxable=str(av.get("taxable", "")),
+                    variant_image="",
+                    shopify_variant_id=av.get("id"),
+                    shopify_inventory_item_id=av.get("inventory_item_id"),
+                )
+            )
+
+        tags = ap.get("tags", "")
+        products[handle] = Product(
+            handle=handle,
+            title=ap.get("title", ""),
+            body_html=ap.get("body_html") or "",
+            vendor=ap.get("vendor", ""),
+            product_type=ap.get("product_type", ""),
+            tags=tags,
+            published="true" if ap.get("status") == "active" else "false",
+            status=ap.get("status", ""),
+            images=images,
+            image_alts=image_alts,
+            variants=variants,
+            shopify_id=ap.get("id"),
+        )
+
+    logger.info("Converted %d API products to internal format", len(products))
+    return products
+
+
+# ----------------------------------------------------------------------
 # Comparison
 # ----------------------------------------------------------------------
 
 @dataclass
+class ProductDiff:
+    """What changed on a single product."""
+    images_changed: bool = False
+    price_changed: bool = False
+    cost_changed: bool = False
+    variants_added: bool = False
+
+    @property
+    def has_changes(self) -> bool:
+        return self.images_changed or self.price_changed or self.cost_changed or self.variants_added
+
+    def __str__(self):
+        parts = []
+        if self.images_changed:
+            parts.append("images")
+        if self.price_changed:
+            parts.append("price")
+        if self.cost_changed:
+            parts.append("cost")
+        if self.variants_added:
+            parts.append("new variants")
+        return ", ".join(parts) if parts else "none"
+
+
+@dataclass
 class SyncPlan:
     """The result of comparing two catalogues."""
-    to_create: list[Product] = field(default_factory=list)     # In new catalogue only
-    to_update_images: list[tuple[Product, Product]] = field(default_factory=list)  # (existing, new) with different images
-    unchanged: list[str] = field(default_factory=list)         # Handles that are identical
+    to_create: list[Product] = field(default_factory=list)
+    to_update: list[tuple[Product, Product, ProductDiff]] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+
+    @property
+    def to_update_images(self) -> list[tuple[Product, Product, ProductDiff]]:
+        return [(old, new, d) for old, new, d in self.to_update if d.images_changed]
+
+    @property
+    def to_update_prices(self) -> list[tuple[Product, Product, ProductDiff]]:
+        return [(old, new, d) for old, new, d in self.to_update if d.price_changed]
+
+    @property
+    def to_update_costs(self) -> list[tuple[Product, Product, ProductDiff]]:
+        return [(old, new, d) for old, new, d in self.to_update if d.cost_changed]
 
     @property
     def summary(self) -> str:
         lines = [
-            f"  New products to create:     {len(self.to_create)}",
-            f"  Products needing image update: {len(self.to_update_images)}",
-            f"  Unchanged products:          {len(self.unchanged)}",
+            f"  New products to create:        {len(self.to_create)}",
+            f"  Products needing updates:      {len(self.to_update)}",
+            f"    - image updates:             {len(self.to_update_images)}",
+            f"    - price updates:             {len(self.to_update_prices)}",
+            f"    - cost updates:              {len(self.to_update_costs)}",
+            f"  Unchanged products:            {len(self.unchanged)}",
         ]
         return "\n".join(lines)
 
@@ -192,7 +300,6 @@ def compare_catalogues(
 ) -> SyncPlan:
     """
     Compare existing Shopify products against the new vendor catalogue.
-
     Returns a SyncPlan describing what actions are needed.
     """
     plan = SyncPlan()
@@ -203,31 +310,68 @@ def compare_catalogues(
             continue
 
         old_prod = existing[handle]
+        diff = _diff_products(old_prod, new_prod)
 
-        # Compare image sets (normalise URLs for comparison)
-        old_images = _normalise_urls(old_prod.images)
-        new_images = _normalise_urls(new_prod.images)
-
-        if old_images != new_images:
-            plan.to_update_images.append((old_prod, new_prod))
+        if diff.has_changes:
+            plan.to_update.append((old_prod, new_prod, diff))
         else:
             plan.unchanged.append(handle)
 
     return plan
 
 
+def _diff_products(old: Product, new: Product) -> ProductDiff:
+    """Compute what changed between two versions of the same product."""
+    diff = ProductDiff()
+
+    # Image comparison
+    old_images = _normalise_urls(old.images)
+    new_images = _normalise_urls(new.images)
+    if old_images != new_images:
+        diff.images_changed = True
+
+    # Price comparison (compare by SKU)
+    old_prices = {v.sku: v.price for v in old.variants if v.sku}
+    new_prices = {v.sku: v.price for v in new.variants if v.sku}
+    for sku, new_price in new_prices.items():
+        old_price = old_prices.get(sku)
+        if old_price is not None and _normalise_price(old_price) != _normalise_price(new_price):
+            diff.price_changed = True
+            break
+
+    # Cost comparison
+    old_costs = {v.sku: v.cost for v in old.variants if v.sku and v.cost}
+    new_costs = {v.sku: v.cost for v in new.variants if v.sku and v.cost}
+    for sku, new_cost in new_costs.items():
+        old_cost = old_costs.get(sku)
+        if old_cost is not None and _normalise_price(old_cost) != _normalise_price(new_cost):
+            diff.cost_changed = True
+            break
+        if old_cost is None and new_cost:
+            # New cost where none existed before
+            diff.cost_changed = True
+            break
+
+    # Check for new variants
+    old_skus = {v.sku for v in old.variants if v.sku}
+    new_skus = {v.sku for v in new.variants if v.sku}
+    if new_skus - old_skus:
+        diff.variants_added = True
+
+    return diff
+
+
 def _normalise_urls(urls: list[str]) -> list[str]:
-    """
-    Strip query strings and normalise for comparison.
-    Shopify CDN URLs often have ?v=XXXXX cache-busters that differ
-    between exports even when the image hasn't changed.
-    """
-    result = []
-    for u in urls:
-        base = u.split("?")[0].strip().rstrip("/")
-        # Also strip the cdn.shopify.com size suffix like _1024x1024
-        result.append(base)
-    return result
+    """Strip query strings for comparison (Shopify CDN adds cache-busters)."""
+    return [u.split("?")[0].strip().rstrip("/") for u in urls]
+
+
+def _normalise_price(price: str) -> str:
+    """Normalise price strings like '10.00', '10', '10.0' → '10.00'."""
+    try:
+        return f"{float(price):.2f}"
+    except (ValueError, TypeError):
+        return price.strip()
 
 
 # ----------------------------------------------------------------------
@@ -249,7 +393,6 @@ def product_to_shopify_payload(product: Product) -> dict:
         "status": product.status.lower() if product.status else "active",
     }
 
-    # Variants
     if product.variants:
         variant_list = []
         for v in product.variants:
@@ -283,7 +426,6 @@ def product_to_shopify_payload(product: Product) -> dict:
             variant_list.append(vd)
         payload["variants"] = variant_list
 
-        # Options (derive from the first variant that has option names)
         options = []
         sample = product.variants[0]
         for i, name in enumerate([sample.option1_name, sample.option2_name, sample.option3_name], 1):
@@ -292,7 +434,6 @@ def product_to_shopify_payload(product: Product) -> dict:
         if options:
             payload["options"] = options
 
-    # Images
     if product.images:
         payload["images"] = [
             {"src": url, "alt": alt}
