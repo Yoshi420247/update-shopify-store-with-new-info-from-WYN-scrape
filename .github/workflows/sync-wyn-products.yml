@@ -25,7 +25,7 @@ on:
       catalogue_csv:
         description: "Path to new catalogue CSV (relative to repo root)"
         required: false
-        default: "data/wyn_catalogue.csv"
+        default: "data/wyn_catalogue.csv.csv"
       auto_tag:
         description: "Auto-tag new products with Oil Slick taxonomy"
         required: false

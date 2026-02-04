@@ -83,7 +83,7 @@ def load_config() -> dict:
         "store_url": store_url,
         "access_token": access_token,
         "shopify_csv": os.getenv("SHOPIFY_EXPORT_CSV", "data/shopify_export.csv"),
-        "catalogue_csv": os.getenv("WYN_CATALOGUE_CSV", "data/wyn_catalogue.csv"),
+        "catalogue_csv": os.getenv("WYN_CATALOGUE_CSV", "data/wyn_catalogue.csv.csv"),
         "vendor": os.getenv("VENDOR_NAME", "What You Need"),
     }
 
