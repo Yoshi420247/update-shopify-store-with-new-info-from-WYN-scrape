@@ -12,6 +12,7 @@ on:
           - live-sync
           - compare-only
           - verify
+          - setup-supabase
         default: dry-run
       source:
         description: "Source for current Shopify state"
@@ -69,6 +70,12 @@ jobs:
         run: |
           # Build the command
           CMD="python sync.py --yes --report sync_report.json"
+
+          # Setup-supabase is a special action that just prints SQL and exits
+          if [ "${{ github.event.inputs.action }}" = "setup-supabase" ]; then
+            python sync.py --setup-supabase
+            exit 0
+          fi
 
           # Action mode
           case "${{ github.event.inputs.action }}" in
