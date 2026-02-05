@@ -14,7 +14,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-API_VERSION = "2024-01"
+API_VERSION = "2025-01"
+REQUEST_TIMEOUT = 30  # seconds
 
 
 class ShopifyAPIError(Exception):
@@ -69,7 +70,7 @@ class ShopifyClient:
         url = f"{self.base}/{path.lstrip('/')}"
         for attempt in range(5):
             self._throttle()
-            resp = self.session.request(method, url, **kwargs)
+            resp = self.session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", 2))
                 logger.warning("Rate limited – sleeping %.1fs (attempt %d)", retry_after, attempt + 1)
@@ -103,7 +104,7 @@ class ShopifyClient:
             body["variables"] = variables
         for attempt in range(5):
             self._throttle()
-            resp = self.session.post(self.graphql_url, json=body)
+            resp = self.session.post(self.graphql_url, json=body, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", 2))
                 logger.warning("GraphQL rate limited – sleeping %.1fs (attempt %d)", retry_after, attempt + 1)
@@ -192,12 +193,29 @@ class ShopifyClient:
         logger.info("Deleted image %d from product %d", image_id, product_id)
 
     def replace_product_images(self, product_id: int, new_image_urls: list[str]):
-        """Delete all existing images then upload new ones in order."""
+        """Upload new images first, then delete old ones.
+
+        Uploading before deleting ensures the product always has images
+        visible on the storefront — even if a later upload fails, the
+        product won't be left with zero images.
+        """
         existing = self.get_product_images(product_id)
-        for img in existing:
-            self.delete_product_image(product_id, img["id"])
+        old_ids = [img["id"] for img in existing]
+
+        # Upload new images first (positions will be fixed after old are removed)
         for pos, url in enumerate(new_image_urls, start=1):
-            self.add_product_image(product_id, url, position=pos)
+            self.add_product_image(product_id, url, position=len(old_ids) + pos)
+
+        # Now remove the old images
+        for img_id in old_ids:
+            self.delete_product_image(product_id, img_id)
+
+        # Re-order the remaining (new) images to correct positions
+        remaining = self.get_product_images(product_id)
+        for pos, img in enumerate(remaining, start=1):
+            if img.get("position") != pos:
+                self._put(f"products/{product_id}/images/{img['id']}.json",
+                          {"image": {"position": pos}})
 
     # ------------------------------------------------------------------
     # Variant operations

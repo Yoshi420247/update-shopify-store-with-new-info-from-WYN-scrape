@@ -88,7 +88,7 @@ Actions tab with these inputs:
 |-------|---------|---------|
 | action | dry-run, live-sync, compare-only, verify | dry-run |
 | source | from-api, from-csv | from-api |
-| catalogue_csv | path to CSV in repo | data/wyn_catalogue.csv |
+| catalogue_csv | path to CSV in repo | data/wyn_catalogue.csv.csv |
 | auto_tag | true/false | true |
 | publish | true/false | true |
 | set_prices | true/false | true |

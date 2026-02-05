@@ -174,6 +174,7 @@ def execute_plan(
         "errors": [],
     }
     sb = sb or SupabaseLogger()  # no-op if not configured
+    _id_cache: dict = {}  # shared handle->id cache for this run
 
     # ======= Phase 1: Create new products =======
     created_products = []  # list of (catalogue_product, shopify_response)
@@ -243,7 +244,7 @@ def execute_plan(
     image_updates = plan.to_update_images
     if image_updates:
         logger.info("Phase 3: Updating images on %d products...", len(image_updates))
-        handle_to_id = _get_handle_to_id(client, cfg)
+        handle_to_id = _get_handle_to_id(client, cfg, _id_cache)
 
         for i, (old_prod, new_prod, diff) in enumerate(image_updates, 1):
             logger.info("  [%d/%d] Updating images: %s", i, len(image_updates), old_prod.title)
@@ -278,7 +279,7 @@ def execute_plan(
     price_updates = plan.to_update_prices
     if price_updates:
         logger.info("Phase 4: Updating prices on %d products...", len(price_updates))
-        handle_to_id = _get_handle_to_id(client, cfg)
+        handle_to_id = _get_handle_to_id(client, cfg, _id_cache)
 
         for i, (old_prod, new_prod, diff) in enumerate(price_updates, 1):
             logger.info("  [%d/%d] Updating prices: %s", i, len(price_updates), old_prod.title)
@@ -324,7 +325,7 @@ def execute_plan(
     cost_updates = plan.to_update_costs
     if cost_updates:
         logger.info("Phase 5: Updating costs on %d products...", len(cost_updates))
-        handle_to_id = _get_handle_to_id(client, cfg)
+        handle_to_id = _get_handle_to_id(client, cfg, _id_cache)
 
         for i, (old_prod, new_prod, diff) in enumerate(cost_updates, 1):
             logger.info("  [%d/%d] Updating costs: %s", i, len(cost_updates), old_prod.title)
@@ -342,10 +343,15 @@ def execute_plan(
                     for sku, cost in cost_map.items():
                         retail = calculate_retail_price(cost)
                         live_v = live_variants.get(sku)
-                        if retail and live_v:
-                            client.update_variant(live_v["id"], {"price": retail})
-                            logger.info("    Updated retail price for SKU %s: cost=%s -> retail=%s",
-                                       sku, cost, retail)
+                        if not retail or not live_v:
+                            continue
+                        # Only update if the retail price actually differs
+                        current_price = live_v.get("price", "")
+                        if current_price and f"{float(current_price):.2f}" == retail:
+                            continue
+                        client.update_variant(live_v["id"], {"price": retail})
+                        logger.info("    Updated retail price for SKU %s: cost=%s -> retail=%s",
+                                   sku, cost, retail)
 
                 report["costs_updated"].append({
                     "title": old_prod.title, "handle": old_prod.handle,
@@ -363,7 +369,7 @@ def execute_plan(
     variant_additions = plan.to_add_variants
     if variant_additions:
         logger.info("Phase 6: Adding variants to %d products...", len(variant_additions))
-        handle_to_id = _get_handle_to_id(client, cfg)
+        handle_to_id = _get_handle_to_id(client, cfg, _id_cache)
 
         for i, (old_prod, new_prod, diff) in enumerate(variant_additions, 1):
             logger.info("  [%d/%d] Adding variants to: %s (SKUs: %s)",
@@ -446,17 +452,21 @@ def execute_plan(
     return report
 
 
-# Cache for handle -> ID lookups
-_handle_id_cache: dict[str, int] | None = None
+def _get_handle_to_id(client: ShopifyClient, cfg: dict, cache: dict = None) -> dict[str, int]:
+    """Fetch and cache handle -> Shopify product ID mapping.
 
-
-def _get_handle_to_id(client: ShopifyClient, cfg: dict) -> dict[str, int]:
-    """Fetch and cache handle -> Shopify product ID mapping."""
-    global _handle_id_cache
-    if _handle_id_cache is None:
-        live_products = client.get_all_products(vendor=cfg["vendor"])
-        _handle_id_cache = {p["handle"]: p["id"] for p in live_products}
-    return _handle_id_cache
+    Pass the same ``cache`` dict across calls within a single sync run
+    to avoid redundant API fetches.  The mapping is stored under the
+    ``"data"`` key so we can distinguish an empty store from an
+    un-fetched cache.
+    """
+    if cache is not None and "data" in cache:
+        return cache["data"]
+    live_products = client.get_all_products(vendor=cfg["vendor"])
+    mapping = {p["handle"]: p["id"] for p in live_products}
+    if cache is not None:
+        cache["data"] = mapping
+    return mapping
 
 
 def verify(client: ShopifyClient, cfg: dict) -> tuple[bool, dict]:
@@ -621,6 +631,15 @@ def main():
         cfg["vendor"] = args.vendor
 
     # ------------------------------------------------------------------
+    # Validate catalogue CSV exists before doing anything
+    # ------------------------------------------------------------------
+    cat_path = Path(cfg["catalogue_csv"])
+    if not cat_path.exists():
+        logger.error("Catalogue CSV not found: %s", cat_path.resolve())
+        logger.error("Place the WYN catalogue CSV at that path, or override with --catalogue-csv.")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
     # Compare-only mode
     # ------------------------------------------------------------------
     if args.compare_only:
@@ -673,10 +692,6 @@ def main():
             print("Aborted.")
             return
 
-    # Reset cache before execution
-    global _handle_id_cache
-    _handle_id_cache = None
-
     # Initialize Supabase logger
     sb = SupabaseLogger()
     sb.start_run(
@@ -706,6 +721,18 @@ def main():
 
     write_report(report, args.report)
     sb.finish_run(report["status"], report)
+
+    # Final summary
+    logger.info(
+        "Final summary: created=%d, images_updated=%d, prices_updated=%d, "
+        "costs_updated=%d, variants_added=%d, errors=%d",
+        len(report.get("created", [])),
+        len(report.get("images_updated", [])),
+        len(report.get("prices_updated", [])),
+        len(report.get("costs_updated", [])),
+        len(report.get("variants_added", [])),
+        len(report.get("errors", [])),
+    )
 
     if not ok:
         sys.exit(1)

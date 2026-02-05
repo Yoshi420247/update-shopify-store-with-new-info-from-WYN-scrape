@@ -94,6 +94,7 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None,
 
     products: dict[str, Product] = {}
     current_handle: str | None = None
+    skipped_rows = 0
 
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -109,6 +110,7 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None,
             if not handle:
                 handle = current_handle
             if not handle:
+                skipped_rows += 1
                 continue
 
             current_handle = handle
@@ -151,7 +153,7 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None,
                 price = csv_price
                 cost = csv_cost
 
-            if sku or price or csv_price:
+            if sku or price or cost:
                 prod.variants.append(
                     Variant(
                         sku=sku,
@@ -174,6 +176,18 @@ def parse_shopify_csv(path: str | Path, vendor_filter: str = None,
                         variant_image=g(row, "variant image"),
                     )
                 )
+
+    if skipped_rows:
+        logger.warning("Skipped %d CSV rows with no handle", skipped_rows)
+
+    # Warn about duplicate SKUs within the same product
+    for handle, prod in products.items():
+        skus = [v.sku for v in prod.variants if v.sku]
+        seen = set()
+        for sku in skus:
+            if sku in seen:
+                logger.warning("Duplicate SKU '%s' in product '%s' (%s)", sku, prod.title, handle)
+            seen.add(sku)
 
     logger.info("Parsed %d products from %s", len(products), path.name)
     return products
